@@ -41,6 +41,25 @@ pub struct EmbeddingChunk {
     pub caption: Option<String>,
 }
 
+/// A raw video + audio segment shipped from a follower to the leader for
+/// persistent storage (replay). Each segment corresponds to one chunk
+/// window and carries every captured JPEG frame plus the PCM audio.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoSegment {
+    /// Unique id, typically `<camera_id>-<seq>`.
+    pub segment_id: String,
+    pub camera_id: String,
+    /// Unix epoch milliseconds.
+    pub start_ts_ms: u64,
+    pub end_ts_ms: u64,
+    /// Ordered JPEG-encoded frames captured during this window.
+    pub jpeg_frames: Vec<Vec<u8>>,
+    /// Mono f32 PCM audio at `audio_sample_rate` Hz.
+    pub audio_samples: Vec<f32>,
+    /// Sample rate of `audio_samples` (typically 16 000).
+    pub audio_sample_rate: u32,
+}
+
 /// Frames sent follower -> leader on `INGEST_ALPN`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FollowerMsg {
@@ -49,6 +68,8 @@ pub enum FollowerMsg {
         camera_id: String,
     },
     Chunk(EmbeddingChunk),
+    /// Raw video + audio segment for persistent storage / replay.
+    Video(VideoSegment),
     /// JPEG snapshot returned in response to a `LeaderMsg::FrameRequest`.
     /// Carries the latest captured frame from the follower's webcam, encoded
     /// as JPEG so the leader can serve it directly to HTTP clients.
@@ -74,6 +95,8 @@ pub enum FollowerMsg {
 pub enum LeaderMsg {
     /// Acknowledges receipt + persistence of a chunk by id.
     Ack { chunk_id: String },
+    /// Acknowledges receipt + storage of a video segment.
+    VideoAck { segment_id: String },
     /// Asks the follower to send back its latest webcam frame as JPEG.
     /// The follower's response carries the same `req_id` so the leader can
     /// route it back to the waiting HTTP request.

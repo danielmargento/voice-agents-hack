@@ -277,6 +277,7 @@ async fn run_session(
             let Some(msg) = msg else { break };
             match msg {
                 LeaderMsg::Ack { chunk_id } => debug!(%chunk_id, "ack"),
+                LeaderMsg::VideoAck { segment_id } => debug!(%segment_id, "video ack"),
                 LeaderMsg::FrameRequest { req_id } => {
                     let frame = frames_for_reader.current();
                     let writer = writer_for_reader.clone();
@@ -357,6 +358,10 @@ async fn run_session(
             .map(|h| h.buffer.drain())
             .unwrap_or_default();
 
+        // Clone frames + audio for video segment (before embedding consumes them).
+        let video_frames = sampled_frames.clone();
+        let video_audio = audio_samples.clone();
+
         let input = ChunkInput {
             frames: sampled_frames,
             audio_samples,
@@ -404,6 +409,29 @@ async fn run_session(
         if writer_tx.send(FollowerMsg::Chunk(chunk)).await.is_err() {
             break SessionEnd::Disconnected("writer channel closed".into());
         }
+
+        // --- Send raw video segment for leader-side storage / replay ---
+        let segment_id = format!("{}-{}", args.camera_id, *total_sent);
+        let jpeg_frames: Vec<Vec<u8>> = video_frames
+            .iter()
+            .filter_map(|f| encode_jpeg(f, 85).ok().map(|(bytes, _, _)| bytes))
+            .collect();
+        if !jpeg_frames.is_empty() {
+            let seg = common::VideoSegment {
+                segment_id: segment_id.clone(),
+                camera_id: args.camera_id.clone(),
+                start_ts_ms: ts,
+                end_ts_ms: now_ms(),
+                jpeg_frames,
+                audio_samples: video_audio,
+                audio_sample_rate: 16_000,
+            };
+            if writer_tx.send(FollowerMsg::Video(seg)).await.is_err() {
+                break SessionEnd::Disconnected("writer channel closed".into());
+            }
+            debug!(segment = %segment_id, "video segment sent");
+        }
+
         *total_sent += 1;
         sent_this_session += 1;
         info!(total = *total_sent, session = sent_this_session, dim, video_dim = vd, audio_dim = ad, "chunk sent");

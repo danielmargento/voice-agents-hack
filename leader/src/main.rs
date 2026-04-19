@@ -11,6 +11,7 @@
 //! workspace + this binary to bring it back.
 
 // mod cactus_llm; // disabled: cactus-sys workspace dep is unavailable
+mod storage;
 
 use std::{
     collections::HashMap,
@@ -33,6 +34,7 @@ use axum::{
 };
 use clap::Parser;
 use common::{read_frame, write_frame, FollowerMsg, LeaderMsg, Ticket, INGEST_ALPN};
+use storage::RecordingStore;
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router as IrohRouter},
@@ -68,6 +70,10 @@ struct Args {
     /// How long to wait for a follower's frame response before giving up.
     #[arg(long, default_value_t = 2000)]
     frame_timeout_ms: u64,
+
+    /// Directory where video recordings from followers are stored.
+    #[arg(long, env = "LEADER_RECORDINGS_DIR", default_value = "./recordings")]
+    recordings_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -115,12 +121,16 @@ async fn main() -> Result<()> {
     println!("  2. From another computer (Remote):");
     println!("     cargo run --release -p follower -- {ticket_str} --camera-id cam-partner\n");
 
+    let recording_store = RecordingStore::new(&args.recordings_dir)
+        .context("init recording store")?;
+
     // Shared state used by both the iroh ingest handler and the HTTP server.
     let app_state = AppState {
         registry: Arc::new(RwLock::new(HashMap::new())),
         next_req_id: Arc::new(AtomicU64::new(1)),
         chunks_total: Arc::new(AtomicU64::new(0)),
         frame_timeout: Duration::from_millis(args.frame_timeout_ms),
+        recordings: Arc::new(recording_store),
     };
 
     let handler = IngestHandler {
@@ -243,6 +253,7 @@ struct AppState {
     next_req_id: Arc<AtomicU64>,
     chunks_total: Arc<AtomicU64>,
     frame_timeout: Duration,
+    recordings: Arc<RecordingStore>,
 }
 
 fn now_ms() -> u64 {
@@ -398,6 +409,27 @@ async fn serve_stream(
                             break;
                         }
                     }
+                    FollowerMsg::Video(seg) => {
+                        if let Some(e) = entry.as_ref() {
+                            e.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+                        }
+                        let sid = seg.segment_id.clone();
+                        let store = state.recordings.clone();
+                        // Store asynchronously so we don't block the stream
+                        // handler while ffmpeg runs.
+                        let otx = outbound_tx.clone();
+                        tokio::spawn(async move {
+                            match store.store_segment(&seg).await {
+                                Ok(path) => {
+                                    info!(segment = %sid, path = %path.display(), "video stored");
+                                }
+                                Err(e) => {
+                                    warn!(segment = %sid, %e, "failed to store video");
+                                }
+                            }
+                            let _ = otx.send(LeaderMsg::VideoAck { segment_id: sid }).await;
+                        });
+                    }
                     FollowerMsg::FrameResponse { req_id, ts_ms, width, height, jpeg } => {
                         if let Some(e) = entry.as_ref() {
                             e.last_seen_ms.store(now_ms(), Ordering::Relaxed);
@@ -464,6 +496,9 @@ async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
     let app = Router::new()
         .route("/api/cameras", get(list_cameras))
         .route("/api/live/:camera_id", get(live_jpg))
+        .route("/api/recordings", get(list_recording_cameras))
+        .route("/api/recordings/:camera_id", get(list_camera_recordings))
+        .route("/api/recordings/:camera_id/:filename", get(serve_recording))
         .layer(cors)
         .with_state(state);
 
@@ -562,5 +597,56 @@ async fn live_jpg(
         )
             .into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "frame request timed out").into_response(),
+    }
+}
+
+// ──────────────────────── recordings endpoints ───────────────────────
+
+/// `GET /api/recordings` — list camera IDs that have stored recordings.
+async fn list_recording_cameras(State(state): State<AppState>) -> Response {
+    match state.recordings.list_cameras() {
+        Ok(cameras) => Json(cameras).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+/// `GET /api/recordings/:camera_id` — list recording segments for a camera.
+async fn list_camera_recordings(
+    State(state): State<AppState>,
+    AxPath(camera_id): AxPath<String>,
+) -> Response {
+    match state.recordings.list_recordings(&camera_id) {
+        Ok(recs) => Json(recs).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+/// `GET /api/recordings/:camera_id/:filename` — serve an MP4 recording file.
+async fn serve_recording(
+    State(state): State<AppState>,
+    AxPath((camera_id, filename)): AxPath<(String, String)>,
+) -> Response {
+    let path = match state.recordings.recording_path(&camera_id, &filename) {
+        Some(p) => p,
+        None => {
+            return (StatusCode::NOT_FOUND, "recording not found").into_response();
+        }
+    };
+
+    match tokio::fs::read(&path).await {
+        Ok(data) => (
+            [
+                (header::CONTENT_TYPE, "video/mp4"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    &format!("inline; filename=\"{filename}\""),
+                ),
+            ],
+            data,
+        )
+            .into_response(),
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("read failed: {e}")).into_response()
+        }
     }
 }

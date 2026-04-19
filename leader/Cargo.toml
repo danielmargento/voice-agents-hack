@@ -20,6 +20,7 @@ rand.workspace = true
 rand_core_06.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+tempfile = "3"
 tokio.workspace = true
 tower-http = { version = "0.5", features = ["cors"] }
 tracing.workspace = true
