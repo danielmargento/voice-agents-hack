@@ -165,6 +165,13 @@ async fn main() -> Result<()> {
         }
     };
 
+    let gemini_api_key = std::env::var("GEMINI_API_KEY").ok();
+    if gemini_api_key.is_some() {
+        info!("GEMINI_API_KEY set — semantic query embedding enabled");
+    } else {
+        info!("GEMINI_API_KEY not set — query will use recency-only ranking");
+    }
+
     // Shared state used by both the iroh ingest handler and the HTTP server.
     let app_state = AppState {
         registry: Arc::new(RwLock::new(HashMap::new())),
@@ -174,6 +181,7 @@ async fn main() -> Result<()> {
         store,
         #[cfg(feature = "cactus")]
         llm,
+        gemini_api_key,
     };
 
     let handler = IngestHandler {
@@ -299,6 +307,7 @@ struct AppState {
     store: Arc<EmbeddingStore>,
     #[cfg(feature = "cactus")]
     llm: Option<Arc<CactusModel>>,
+    gemini_api_key: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -654,8 +663,13 @@ async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Resp
         return (StatusCode::BAD_REQUEST, "empty query").into_response();
     }
 
-    let handler = CactusQueryHandler::new(model);
+    let handler = CactusQueryHandler::new(model, state.gemini_api_key.clone());
     let now = now_ms();
+
+    // Embed the query text into the same Gemini 3072-dim space as the stored
+    // video embeddings for semantic nearest-neighbor retrieval. Falls back to
+    // recency-only when no API key is configured.
+    let query_embedding = handler.embed_query(&req.query).await;
 
     // Skip the LLM-based query parser — Gemma 4 E2B on CPU spends minutes
     // "thinking" before emitting JSON, which makes the UI hang. Use sane
@@ -666,6 +680,7 @@ async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Resp
         time_end_ms: Some(now),
         camera_ids: req.cameras.clone(),
         top_k: req.top_k.map(|k| k as usize).unwrap_or(20),
+        query_embedding,
     };
     let chunks = state.store.query(&filter);
     let n_chunks = chunks.len();
@@ -727,6 +742,7 @@ mod tests {
             time_end_ms: None,
             camera_ids: None,
             top_k: 10,
+            query_embedding: None,
         });
         assert_eq!(results.len(), 2);
     }

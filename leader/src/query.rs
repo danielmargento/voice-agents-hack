@@ -9,6 +9,9 @@ use tracing::{debug, info, warn};
 use crate::cactus::CactusModel;
 use crate::store::StoredChunk;
 
+const GEMINI_EMBED_MODEL: &str = "models/gemini-embedding-2-preview";
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+
 pub struct ParsedQuery {
     pub time_start_ms: Option<u64>,
     pub time_end_ms: Option<u64>,
@@ -18,11 +21,44 @@ pub struct ParsedQuery {
 
 pub struct CactusQueryHandler {
     model: Arc<CactusModel>,
+    gemini_api_key: Option<String>,
+    http: reqwest::Client,
 }
 
 impl CactusQueryHandler {
-    pub fn new(model: Arc<CactusModel>) -> Self {
-        Self { model }
+    pub fn new(model: Arc<CactusModel>, gemini_api_key: Option<String>) -> Self {
+        Self { model, gemini_api_key, http: reqwest::Client::new() }
+    }
+
+    /// Embed a natural-language query using Gemini Embedding 2 so it can be
+    /// compared against the video embeddings in the store (same 3072-dim space).
+    /// Returns None if no API key is configured or the request fails.
+    pub async fn embed_query(&self, text: &str) -> Option<Vec<f32>> {
+        let api_key = self.gemini_api_key.as_deref()?;
+        let url = format!("{GEMINI_API_BASE}/{GEMINI_EMBED_MODEL}:embedContent");
+        let body = json!({
+            "content": {
+                "parts": [{ "text": text }]
+            }
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-goog-api-key", api_key)
+            .json(&body)
+            .send()
+            .await
+            .ok()?;
+        let val: serde_json::Value = resp.json().await.ok()?;
+        let values = val["embedding"]["values"].as_array()?;
+        let embedding: Vec<f32> = values.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+        if embedding.is_empty() {
+            warn!("embed_query: got empty embedding from Gemini");
+            None
+        } else {
+            info!(dim = embedding.len(), "embed_query: got embedding");
+            Some(embedding)
+        }
     }
 
     pub async fn parse_nl_query(
