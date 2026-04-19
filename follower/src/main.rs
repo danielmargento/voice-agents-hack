@@ -80,6 +80,13 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     frames_per_chunk: usize,
 
+    /// Target frames-per-second for video recording. Frames are captured
+    /// at this rate throughout each chunk window and shipped to the leader
+    /// for MP4 storage. Embedding still uses only `--frames-per-chunk`
+    /// evenly-spaced samples from the same buffer.
+    #[arg(long, default_value_t = 10)]
+    video_fps: u32,
+
     /// Directory where captured JPEG frames are written (one file per
     /// chunk, named `<camera-id>-<seq>.jpg`). Created if missing.
     #[arg(long, env = "FOLLOWER_FRAME_DIR", default_value = "./frames")]
@@ -316,26 +323,28 @@ async fn run_session(
         }
     });
 
-    // --- Push loop: collect K frames over the chunk window, then embed --
-    let chunk_duration = Duration::from_millis(args.interval_ms);
+    // --- Push loop: capture at video_fps, pick K for embedding ----------
+    let _chunk_duration = Duration::from_millis(args.interval_ms);
     let k = args.frames_per_chunk.max(1);
-    let frame_interval = chunk_duration / k as u32;
+    let video_fps = args.video_fps.max(1);
+    let capture_interval = Duration::from_millis(1000 / video_fps as u64);
+    let total_video_frames = ((args.interval_ms as f64 / 1000.0) * video_fps as f64).ceil() as usize;
     let mut sent_this_session: u64 = 0;
     let mut stop = std::pin::pin!(tokio::signal::ctrl_c());
 
     let result = loop {
-        // Collect K evenly-spaced frames across the chunk window.
+        // Capture frames at video_fps throughout the chunk window.
         let chunk_start_ms = now_ms();
-        let mut sampled_frames: Vec<CapturedFrame> = Vec::with_capacity(k);
-        let mut frame_ticker = tokio::time::interval(frame_interval);
+        let mut all_frames: Vec<CapturedFrame> = Vec::with_capacity(total_video_frames);
+        let mut frame_ticker = tokio::time::interval(capture_interval);
         frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let mut aborted = false;
-        for _i in 0..k {
+        for _i in 0..total_video_frames {
             tokio::select! {
                 _ = frame_ticker.tick() => {
                     if let Some(f) = frames.current() {
-                        sampled_frames.push(f);
+                        all_frames.push(f);
                     }
                 }
                 _ = &mut stop => {
@@ -348,18 +357,30 @@ async fn run_session(
             break SessionEnd::CtrlC;
         }
 
-        if sampled_frames.is_empty() {
+        if all_frames.is_empty() {
             warn!("no frames captured this chunk, skipping");
             continue;
         }
+
+        // Pick K evenly-spaced frames from the full buffer for embedding.
+        let sampled_frames: Vec<CapturedFrame> = if all_frames.len() <= k {
+            all_frames.clone()
+        } else {
+            (0..k)
+                .map(|i| {
+                    let idx = i * (all_frames.len() - 1) / (k - 1).max(1);
+                    all_frames[idx].clone()
+                })
+                .collect()
+        };
 
         // Drain the audio accumulated during this window.
         let audio_samples = audio_buf
             .map(|h| h.buffer.drain())
             .unwrap_or_default();
 
-        // Clone frames + audio for video segment (before embedding consumes them).
-        let video_frames = sampled_frames.clone();
+        // All captured frames go to the video segment; K samples go to embedding.
+        let video_frames = all_frames;
         let video_audio = audio_samples.clone();
 
         let input = ChunkInput {
